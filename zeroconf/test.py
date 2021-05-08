@@ -6,6 +6,7 @@
 
 import copy
 import errno
+import functools
 import itertools
 import logging
 import os
@@ -18,6 +19,8 @@ import unittest
 import unittest.mock
 from threading import Event
 from typing import Dict, Optional, cast  # noqa # used in type hints
+
+import ifaddr
 
 import pytest
 
@@ -522,6 +525,42 @@ class Names(unittest.TestCase):
         zc.send(out)
 
 
+def may_mock_ipv6(test):
+    """Decorator to mock IPv6 support when SKIP_IPV6 is set.
+    The mock IPv6 sockets don't pass packets, but allow testing of binding to IPv6 interfaces."""
+
+    @functools.wraps(test)
+    def wrapper(*test_args, **test_kwds):
+        # Supply a mock if_nametoindex if the Python distribution was built without one.
+        if not hasattr(socket, 'if_nametoindex'):
+            socket.if_nametoindex = lambda if_name: 0
+        adapters = ifaddr.get_adapters()
+        # Add fake IPv6 addresses
+        for adapter_ix, adapter in enumerate(adapters):
+            if adapter.name == 'lo':
+                adapter.ips.append(ifaddr.IP(('::1', 0, adapter_ix), 128, adapter.name))
+            else:
+                adapter.ips.append(ifaddr.IP(('fe80::1', 0, adapter_ix), 64, adapter.name))
+        # Mock only IPv6 sockets
+        real_socket = socket.socket
+
+        def mock_socket(family=-1, *sock_args, **sock_kwds):
+            if family == socket.AF_INET6:
+                return unittest.mock.MagicMock(spec=real_socket)
+            else:
+                return real_socket(family, *sock_args, **sock_kwds)
+
+        with unittest.mock.patch('ifaddr.get_adapters', return_value=adapters), unittest.mock.patch(
+            'socket.socket', side_effect=mock_socket
+        ):
+            return test(*test_args, *test_kwds)
+
+    if os.environ.get('SKIP_IPV6'):
+        return wrapper
+    else:
+        return test
+
+
 class Framework(unittest.TestCase):
     def test_launch_and_close(self):
         rv = r.Zeroconf(interfaces=r.InterfaceChoice.All)
@@ -541,7 +580,7 @@ class Framework(unittest.TestCase):
         rv.close()
 
     @unittest.skipIf(not socket.has_ipv6, 'Requires IPv6')
-    @unittest.skipIf(os.environ.get('SKIP_IPV6'), 'IPv6 tests disabled')
+    @may_mock_ipv6
     def test_launch_and_close_v4_v6(self):
         rv = r.Zeroconf(interfaces=r.InterfaceChoice.All, ip_version=r.IPVersion.All)
         rv.close()
@@ -549,7 +588,7 @@ class Framework(unittest.TestCase):
         rv.close()
 
     @unittest.skipIf(not socket.has_ipv6, 'Requires IPv6')
-    @unittest.skipIf(os.environ.get('SKIP_IPV6'), 'IPv6 tests disabled')
+    @may_mock_ipv6
     def test_launch_and_close_v6_only(self):
         rv = r.Zeroconf(interfaces=r.InterfaceChoice.All, ip_version=r.IPVersion.V6Only)
         rv.close()
@@ -1021,7 +1060,7 @@ class ServiceTypesQuery(unittest.TestCase):
             zeroconf_registrar.close()
 
     @unittest.skipIf(not socket.has_ipv6, 'Requires IPv6')
-    @unittest.skipIf(os.environ.get('SKIP_IPV6'), 'IPv6 tests disabled')
+    @may_mock_ipv6
     def test_integration_with_listener_v6_records(self):
 
         type_ = "_test-srvc-type._tcp.local."
